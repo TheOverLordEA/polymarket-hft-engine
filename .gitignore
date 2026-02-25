@@ -1,0 +1,10 @@
+# Environments
+.env
+.env.*
+
+# Rust
+target/
+**/*.rs.bk
+
+# Logs
+*.log
