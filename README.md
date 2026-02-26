@@ -6,15 +6,13 @@
 
 **PolyHFT** is a high-frequency, asynchronous trading engine designed for Polymarket's 5-minute crypto markets.
 
-It is not a "get rich quick" script. It is a **latency-engineered infrastructure layer** built for quants who understand that in HFT, infrastructure is the moat.
-
 This engine handles the "plumbing" so you can focus on the math. It solves the problems of market microstructure, state persistence, and RPC latency management out of the box.
 
 ---
 
 ## ⚡ Why This Engine Exists
 
-Retail bots fail because they run on Python, use public RPCs, and crash on edge cases. PolyHFT is built to pass the "Institutional Test":
+Ready to use polymarket bot built with rust. I wasn't able to find any open source polymarket bot built with rust, so I decided to build one for myself. It works with polymarket CLOB and uses binance and coinbase for price feeds. It also has a built in risk management system that prevents you from losing money. The bot was built for 5 minute crypto markets and is optimized for speed and accuracy.
 
 ### 1. The Ultra-Low Latency Stack
 This engine is built to maximize the speed of the **Rust + AWS `eu-west-1` + Alchemy + Binance/Coinbase** pipeline. 
@@ -77,8 +75,8 @@ Setup
     Clone the Repo
     Bash
 
-    git clone https://github.com/YOUR_USERNAME/poly-hft.git
-    cd poly-hft
+    git clone https://github.com/TheOverLordEA/poly-hft-engine.git
+    cd poly-hft-engine
 
     Configure Environment
     Create a .env file in the bot directory:
@@ -114,9 +112,6 @@ If want a custom implementation with your strategy and vps:
 
    I can help you with deploy & colocate your bot on AWS eu-west-1 or us-east-1 for maximum speed.
 
-   I can help you with optimize the fee/spread math for your specific capital size.
-
-Rate: Flat fee for 48-hour delivery.
-Status: ✅ OPEN for 2 clients this week.
+   I can help you with optimize the fee/spread math for your specific capital size
 
 [Contact Me via DM] or open an Issue titled "Consulting Request".
