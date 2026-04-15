@@ -316,15 +316,53 @@ impl Default for DumpStrategy {
     }
 }
 
-/// Simulate a maker dump: post one ask at `ask_price`, assume
-/// `fill_rate` of the target fills before expiry. Returns a WalkedFill
-/// compatible with the taker path so the rest of `run_event` doesn't
-/// need to branch.
+/// Book-state-aware fill-rate estimate for a maker ask posted at `ask_price`.
+///
+/// Rules:
+///   - If the book has no existing asks (fresh market), OR our ask sits at
+///     or below the current best ask, we become (or remain) the new best
+///     ask and should be lifted quickly — `max_rate`.
+///
+///   - If our ask is ABOVE the best ask, we're sitting behind a wall of
+///     existing liquidity that taker flow has to clear first. Fill rate
+///     decays linearly with the percentage gap, reaching a floor of
+///     `max_rate / 2` at 10% above the best ask.
+///
+/// This replaces the constant-fill-rate assumption of the first maker
+/// model, which produced a linear markup sweep (every +0.05 added the
+/// same ~2.8pp of ROI). With the dynamic rate, higher markups push us
+/// further behind the wall and depress the fill rate — so the sweep
+/// should turn non-linear with an empirically discoverable optimum.
+pub fn dynamic_fill_rate(book: &ClobBook, ask_price: f64, max_rate: f64) -> f64 {
+    let best_ask = book
+        .asks
+        .iter()
+        .filter_map(|l| l.price.parse::<f64>().ok())
+        .fold(f64::MAX, f64::min);
+
+    if best_ask == f64::MAX || ask_price <= best_ask {
+        return max_rate;
+    }
+
+    let gap_pct = (ask_price - best_ask) / best_ask;
+    let decay_window = 0.10; // linearly decay over 10% above best ask
+    let floor = max_rate * 0.5;
+    let t = (gap_pct / decay_window).min(1.0);
+    max_rate * (1.0 - t) + floor * t
+}
+
+/// Simulate a maker dump: post one ask at `ask_price`, assume the
+/// book-aware `dynamic_fill_rate` of the target fills before expiry.
+/// Returns a WalkedFill compatible with the taker path so the rest of
+/// `run_event` doesn't need to branch.
+///
+/// `max_fill_rate` is the ceiling — what you'd get if you were inside
+/// the spread. Behind-the-wall asks decay from there.
 pub fn simulate_maker_dump(
     book: &ClobBook,
     target_shares: f64,
     markup: f64,
-    fill_rate: f64,
+    max_fill_rate: f64,
     mint_cost_per_share: f64,
 ) -> WalkedFill {
     // Fair value = max(clob mid, mint_cost_per_share). The latter is the
@@ -333,6 +371,7 @@ pub fn simulate_maker_dump(
     let fair = mid.max(mint_cost_per_share);
     let ask_price = fair * markup;
 
+    let fill_rate = dynamic_fill_rate(book, ask_price, max_fill_rate);
     let filled = target_shares * fill_rate;
     let gross = filled * ask_price;
 
@@ -1132,25 +1171,54 @@ mod tests {
     }
 
     #[test]
-    fn maker_sim_uses_mid_times_markup() {
-        // Mid = ($0.38 + $0.42) / 2 = $0.40. Markup 1.10 → ask $0.44.
+    fn maker_sim_inside_wide_spread_gets_max_fill_rate() {
+        // Wide spread: bid $0.20, ask $0.60 → mid $0.40. Markup 1.10 → ask $0.44.
+        // $0.44 is WELL inside the [0.20, 0.60] spread → we become the new best
+        // ask → full fill rate.
+        let book = ClobBook {
+            bids: vec![ClobLevel { price: "0.20".into(), size: "100".into() }],
+            asks: vec![ClobLevel { price: "0.60".into(), size: "100".into() }],
+        };
+        let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
+        assert!((w.avg_price - 0.44).abs() < 0.0001);
+        assert!((w.shares_filled - 75.0).abs() < 0.0001); // 100 * 0.75
+        assert!((w.gross_proceeds_usdc - 33.0).abs() < 0.0001); // 75 * 0.44
+    }
+
+    #[test]
+    fn maker_sim_behind_wall_has_decayed_fill_rate() {
+        // Tight spread: bid $0.38, ask $0.42 → mid $0.40. Markup 1.10 → ask $0.44.
+        // $0.44 is 4.76% ABOVE best_ask $0.42 → behind the wall →
+        // decay_t = 0.476 → fill_rate = 0.75*(1-0.476) + 0.375*0.476 ≈ 0.571
         let book = ClobBook {
             bids: vec![ClobLevel { price: "0.38".into(), size: "100".into() }],
             asks: vec![ClobLevel { price: "0.42".into(), size: "100".into() }],
         };
         let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
-        // Ask = ($0.40) × 1.10 = $0.44
         assert!((w.avg_price - 0.44).abs() < 0.0001);
-        // Filled = 100 × 0.75 = 75
-        assert!((w.shares_filled - 75.0).abs() < 0.0001);
-        // Gross = 75 × 0.44 = 33
-        assert!((w.gross_proceeds_usdc - 33.0).abs() < 0.0001);
+        assert!(w.shares_filled < 75.0 && w.shares_filled > 55.0);
+        // Gross is less than the "inside-spread" case (33.0)
+        assert!(w.gross_proceeds_usdc < 33.0);
+    }
+
+    #[test]
+    fn maker_sim_far_behind_wall_floors_at_half_rate() {
+        // Best ask $0.30, we post $0.48 → 60% above → deep in decay zone.
+        // fill_rate should be at or below the floor (max_rate/2 = 0.375).
+        let book = ClobBook {
+            bids: vec![ClobLevel { price: "0.28".into(), size: "50".into() }],
+            asks: vec![ClobLevel { price: "0.30".into(), size: "50".into() }],
+        };
+        // Force a high markup so we land far behind the wall.
+        // mid = 0.29, markup 1.70 → ask 0.493 which is 64% above best ask.
+        let w = simulate_maker_dump(&book, 100.0, 1.70, 0.75, 0.091);
+        assert!((w.shares_filled - 37.5).abs() < 0.001); // 100 * 0.375
     }
 
     #[test]
     fn maker_sim_uses_mint_cost_floor_when_no_mid() {
         // Empty book → fair falls back to mint_cost_per_share ($0.091).
-        // Ask = $0.091 × 1.10 = $0.1001
+        // Ask = $0.091 × 1.10 = $0.1001. Empty asks → max fill rate.
         let book = ClobBook { bids: vec![], asks: vec![] };
         let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
         assert!((w.avg_price - 0.1001).abs() < 0.0001);
@@ -1158,27 +1226,42 @@ mod tests {
     }
 
     #[test]
-    fn maker_sim_uses_mid_when_mid_above_mint_cost() {
-        // Mid = $0.30 > mint_cost_per_share $0.091 → use mid.
-        let book = ClobBook {
-            bids: vec![ClobLevel { price: "0.28".into(), size: "50".into() }],
-            asks: vec![ClobLevel { price: "0.32".into(), size: "50".into() }],
-        };
-        let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
-        // Mid = 0.30, ask = 0.33
-        assert!((w.avg_price - 0.33).abs() < 0.0001);
-    }
-
-    #[test]
     fn maker_sim_uses_floor_when_mid_below_mint_cost() {
         // Mid = $0.05 < mint_cost_per_share $0.091 → use floor.
+        // Our ask = 0.1001. Best ask in book is 0.06 → we're above →
+        // fill rate decays. Verify ask price is correct regardless.
         let book = ClobBook {
             bids: vec![ClobLevel { price: "0.04".into(), size: "50".into() }],
             asks: vec![ClobLevel { price: "0.06".into(), size: "50".into() }],
         };
         let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
-        // fair = max(0.05, 0.091) = 0.091, ask = 0.091 × 1.10 = 0.1001
         assert!((w.avg_price - 0.1001).abs() < 0.0001);
+    }
+
+    #[test]
+    fn dynamic_fill_rate_inside_spread() {
+        let book = ClobBook {
+            bids: vec![ClobLevel { price: "0.30".into(), size: "50".into() }],
+            asks: vec![ClobLevel { price: "0.50".into(), size: "50".into() }],
+        };
+        // Our ask 0.44 is below best_ask 0.50 → full rate.
+        assert!((dynamic_fill_rate(&book, 0.44, 0.80) - 0.80).abs() < 1e-9);
+        // At the best ask → still full rate (boundary case).
+        assert!((dynamic_fill_rate(&book, 0.50, 0.80) - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dynamic_fill_rate_full_decay_at_10pct_above() {
+        let book = ClobBook {
+            bids: vec![],
+            asks: vec![ClobLevel { price: "0.40".into(), size: "50".into() }],
+        };
+        // Ask at 0.44 → 10% above best ask → floor = 0.5 * max_rate.
+        let r = dynamic_fill_rate(&book, 0.44, 0.80);
+        assert!((r - 0.40).abs() < 1e-9);
+        // Ask at 0.50 → 25% above → still clamped at floor.
+        let r_far = dynamic_fill_rate(&book, 0.50, 0.80);
+        assert!((r_far - 0.40).abs() < 1e-9);
     }
 
     #[test]
