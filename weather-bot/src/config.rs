@@ -220,8 +220,10 @@ mod tests {
     }
 
     #[test]
-    fn default_mint_size_is_ten() {
-        assert_eq!(Config::default().mint_amount_usdc, 10.0);
+    fn default_mint_size_matches_competitor() {
+        // $62 is @IWantYourMoney's production sizing — above the
+        // rewardsMinSize=50 eligibility floor.
+        assert_eq!(Config::default().mint_amount_usdc, 62.0);
     }
 
     #[test]
@@ -230,8 +232,14 @@ mod tests {
     }
 
     #[test]
-    fn default_polygon_wss_is_public() {
-        assert_eq!(Config::default().polygon_wss_url, "wss://polygon-rpc.com");
+    fn default_polygon_wss_supports_ws_upgrade() {
+        // wss://polygon-rpc.com returns HTML on WS upgrade (not a real
+        // WSS endpoint). 1rpc.io/matic does the handshake but rejects
+        // eth_subscribe — good enough for sim/dev. Live HFT needs
+        // Alchemy or QuickNode.
+        let url = Config::default().polygon_wss_url;
+        assert!(url.starts_with("wss://"));
+        assert!(url != "wss://polygon-rpc.com");
     }
 
     #[test]

@@ -159,20 +159,36 @@ impl PaperAccount {
     }
 
     pub fn net_pnl(&self) -> f64 {
-        self.bankroll_usdc - self.starting_bankroll + self.mark_to_market_open_value()
+        self.net_pnl_at_mark(0.0)
     }
 
-    pub fn mark_to_market_open_value(&self) -> f64 {
-        // Conservative: tail legs marked at zero. Underestimates P&L by the
-        // value of the held lottery tickets.
-        0.0
+    /// Compute realized P&L (no mark-to-market). Conservative — the tail
+    /// legs we hold are worth *something*, but this method pretends they
+    /// aren't. Use `net_pnl_at_mark(open_value)` when you have a real
+    /// estimate of the held shares' value from `PaperEngine::mark_to_market`.
+    pub fn realized_pnl(&self) -> f64 {
+        self.bankroll_usdc - self.starting_bankroll
+    }
+
+    /// Realized P&L plus an externally-computed mark-to-market of open
+    /// positions. The mark usually comes from `PaperEngine::mark_to_market`
+    /// which walks each held token's current CLOB midpoint.
+    pub fn net_pnl_at_mark(&self, open_value: f64) -> f64 {
+        self.bankroll_usdc - self.starting_bankroll + open_value
     }
 
     pub fn roi_pct(&self) -> f64 {
         if self.starting_bankroll == 0.0 {
             return 0.0;
         }
-        100.0 * self.net_pnl() / self.starting_bankroll
+        100.0 * self.realized_pnl() / self.starting_bankroll
+    }
+
+    pub fn roi_pct_at_mark(&self, open_value: f64) -> f64 {
+        if self.starting_bankroll == 0.0 {
+            return 0.0;
+        }
+        100.0 * self.net_pnl_at_mark(open_value) / self.starting_bankroll
     }
 }
 
@@ -216,17 +232,21 @@ pub async fn fetch_book(http: &Client, clob_url: &str, token_id: &str) -> Result
 }
 
 /// Walk the BID side of the book (we're selling), taking as many levels as
-/// needed to fill `target_shares` or exhaust the book. Returns the realized
-/// fill including VWAP and whether we were depth-capped.
-pub fn walk_bids_for_sell(book: &ClobBook, target_shares: f64) -> WalkedFill {
-    // Sort bids descending (best price first)
+/// needed to fill `target_shares` or exhaust the book. Any level priced
+/// below `min_price` is dropped BEFORE walking — this prevents a thin-tail
+/// book (5 shares @ $0.30 + 100 @ $0.02) from diluting the realized VWAP
+/// below the profitability threshold.
+///
+/// `min_price = 0.0` disables the filter (legacy behavior).
+pub fn walk_bids_for_sell(book: &ClobBook, target_shares: f64, min_price: f64) -> WalkedFill {
+    // Sort bids descending (best price first), drop anything below the floor.
     let mut levels: Vec<(f64, f64)> = book
         .bids
         .iter()
         .filter_map(|l| {
             let p = l.price.parse::<f64>().ok()?;
             let s = l.size.parse::<f64>().ok()?;
-            if p > 0.0 && s > 0.0 {
+            if p >= min_price && s > 0.0 {
                 Some((p, s))
             } else {
                 None
@@ -406,9 +426,27 @@ impl PaperEngine {
         let shares_per_bucket = self.mint_amount_usdc; // $X mint → X shares per outcome
         let target_dump = shares_per_bucket * self.dump_fraction;
 
+        // Mint-cost VWAP threshold: 1 / n_buckets is the imputed cost per
+        // share when $X USDC mints X shares across N equal-weight outcomes
+        // (matches gamma's avgPrice calculation for neg-risk conversions).
+        // For $62 across 11 buckets: $62 / (62 * 11) = $0.091/share.
+        //
+        // Rule: if the VWAP we would realize by walking the bid side is
+        // BELOW this threshold, we're dumping at a loss per share. Strictly
+        // dominated by holding as a tail lottery ticket (worst-case P(win)=0
+        // means we lose $0, whereas the sub-threshold dump crystallizes the
+        // loss immediately). So skip.
+        //
+        // This is a strict upgrade over a simple `shares_filled == 0` check:
+        // Paris-style empty books still get skipped, but so do markets with
+        // thin bids at 1-2c that would return pennies on the dollar.
+        let n_buckets = event.buckets.len().max(1) as f64;
+        let mint_cost_per_share = self.mint_amount_usdc / (shares_per_bucket * n_buckets);
+
         let mut total_proceeds = 0.0;
         let mut total_fees = 0.0;
         let mut residual_legs: Vec<PaperPosition> = Vec::new();
+        let mut skipped_below_cost_count: u64 = 0;
         let resolves_at = parse_resolution_date(&event.resolution_date, now_unix);
 
         for bucket in &event.buckets {
@@ -429,7 +467,7 @@ impl PaperEngine {
                         bucket_label: bucket.bucket_label.clone(),
                         token_id,
                         shares_held: shares_per_bucket,
-                        effective_cost_per_share: self.mint_amount_usdc / (event.buckets.len() as f64 * shares_per_bucket).max(1.0),
+                        effective_cost_per_share: mint_cost_per_share,
                         minted_at: now_unix,
                         resolves_at,
                     });
@@ -437,10 +475,38 @@ impl PaperEngine {
                 }
             };
 
-            let walked = walk_bids_for_sell(&book, target_dump);
+            // Effective price floor: we will only consume levels priced at
+            // or above this threshold. The MAX of the legacy dust floor
+            // (min_dump_price) and the imputed mint cost per share — a
+            // dump at price < cost-basis is strictly dominated by holding
+            // the share as a tail lottery ticket.
+            let price_floor = self.min_dump_price.max(mint_cost_per_share);
+            let walked = walk_bids_for_sell(&book, target_dump, price_floor);
 
-            if walked.shares_filled < 1.0 || walked.avg_price < self.min_dump_price {
-                // Too thin or too cheap — skip dumping, keep full position
+            if walked.shares_filled < 1.0 {
+                // Nothing filled above the floor — either the book was
+                // empty, or every bid was sub-cost. Hold as a tail.
+                let reason = if book.bids.is_empty() {
+                    "empty_book"
+                } else {
+                    "all_bids_below_floor"
+                };
+                if reason == "all_bids_below_floor" {
+                    skipped_below_cost_count += 1;
+                }
+                self.log.append(
+                    &event.event_slug,
+                    "dump_skipped",
+                    serde_json::json!({
+                        "bucket": bucket.bucket_label,
+                        "reason": reason,
+                        "price_floor": price_floor,
+                        "mint_cost_per_share": mint_cost_per_share,
+                        "min_dump_price": self.min_dump_price,
+                        "book_bids_count": book.bids.len(),
+                    }),
+                    -1.0,
+                );
                 residual_legs.push(PaperPosition {
                     event_slug: event.event_slug.clone(),
                     city: event.city.clone(),
@@ -448,8 +514,7 @@ impl PaperEngine {
                     bucket_label: bucket.bucket_label.clone(),
                     token_id,
                     shares_held: shares_per_bucket,
-                    effective_cost_per_share: (mint_total + gas_mint)
-                        / (event.buckets.len() as f64 * shares_per_bucket).max(1.0),
+                    effective_cost_per_share: mint_cost_per_share,
                     minted_at: now_unix,
                     resolves_at,
                 });
@@ -524,12 +589,14 @@ impl PaperEngine {
                     "bankroll_after": acct.bankroll_usdc,
                     "open_events": acct.open_event_slugs.len(),
                     "tail_legs_held": acct.open_positions.len(),
+                    "skipped_below_cost": skipped_below_cost_count,
+                    "mint_cost_per_share_threshold": mint_cost_per_share,
                 }),
                 acct.bankroll_usdc,
             );
 
             tracing::info!(
-                "[PAPER] CYCLE {}: mint=-${:.2} gas=-${:.2} fees=-${:.2} proceeds=+${:.2} net={:+.2} | bankroll=${:.2} ROI={:.2}%",
+                "[PAPER] CYCLE {}: mint=-${:.2} gas=-${:.2} fees=-${:.2} proceeds=+${:.2} net={:+.2} | bankroll=${:.2} ROI={:.2}% skipped_below_cost={}",
                 event.event_slug,
                 mint_total,
                 gas_mint,
@@ -537,7 +604,8 @@ impl PaperEngine {
                 total_proceeds,
                 cycle_pnl,
                 acct.bankroll_usdc,
-                acct.roi_pct()
+                acct.roi_pct(),
+                skipped_below_cost_count,
             );
         }
 
@@ -546,6 +614,74 @@ impl PaperEngine {
 
     pub async fn snapshot(&self) -> PaperAccount {
         self.account.lock().await.clone()
+    }
+
+    /// Mark-to-market all open (tail) positions at the current CLOB
+    /// midpoint. Fetches `/book` for each held token_id, uses
+    /// `(best_bid + best_ask) / 2` as the share's implied win probability,
+    /// and returns the total USDC value if every position were liquidated
+    /// at that midpoint.
+    ///
+    /// Fallback if the book has no bids: use best_ask (we could sell to
+    /// any taker at ≤ ask); if no asks: 0. If no quotes at all, the tail
+    /// leg is implicitly worth 0 and excluded.
+    ///
+    /// This is NOT a resolution poll — it does not wait for the event's
+    /// actual outcome. It's a snapshot estimate good enough to credit the
+    /// skip rule against a plausible holding value. The proper resolution
+    /// poller replaces this with the actual $1/$0 settlement in a later
+    /// commit.
+    pub async fn mark_to_market(&self) -> f64 {
+        let acct = self.account.lock().await;
+        let positions = acct.open_positions.clone();
+        drop(acct);
+
+        let mut total = 0.0;
+        let mut priced = 0usize;
+        let mut unpriced = 0usize;
+
+        for pos in &positions {
+            let mid = match fetch_book(&self.http, &self.clob_url, &pos.token_id).await {
+                Ok(book) => book_midpoint(&book).unwrap_or(0.0),
+                Err(_) => 0.0,
+            };
+            if mid > 0.0 {
+                total += pos.shares_held * mid;
+                priced += 1;
+            } else {
+                unpriced += 1;
+            }
+        }
+        tracing::info!(
+            "[PAPER] mark-to-market: {} positions priced, {} unpriced, total ${:.2}",
+            priced,
+            unpriced,
+            total
+        );
+        total
+    }
+}
+
+/// Midpoint of a CLOB book. Returns `None` if there's no sensible quote.
+fn book_midpoint(book: &ClobBook) -> Option<f64> {
+    let best_bid = book
+        .bids
+        .iter()
+        .filter_map(|l| l.price.parse::<f64>().ok())
+        .fold(f64::MIN, f64::max);
+    let best_ask = book
+        .asks
+        .iter()
+        .filter_map(|l| l.price.parse::<f64>().ok())
+        .fold(f64::MAX, f64::min);
+    if best_bid > f64::MIN && best_ask < f64::MAX {
+        Some((best_bid + best_ask) / 2.0)
+    } else if best_bid > f64::MIN {
+        Some(best_bid)
+    } else if best_ask < f64::MAX {
+        Some(best_ask)
+    } else {
+        None
     }
 }
 
@@ -595,7 +731,7 @@ mod tests {
             ],
             asks: vec![],
         };
-        let w = walk_bids_for_sell(&book, 62.0);
+        let w = walk_bids_for_sell(&book, 62.0, 0.0);
         // 28 + 12 + 5 = 45 from top 3; 17 more from the $0.31 wall
         assert_eq!(w.shares_filled, 62.0);
         assert_eq!(w.levels_consumed, 4);
@@ -613,7 +749,7 @@ mod tests {
             }],
             asks: vec![],
         };
-        let w = walk_bids_for_sell(&book, 62.0);
+        let w = walk_bids_for_sell(&book, 62.0, 0.0);
         assert_eq!(w.shares_filled, 5.0);
         assert!(w.capped_by_depth);
     }
@@ -624,9 +760,46 @@ mod tests {
             bids: vec![],
             asks: vec![],
         };
-        let w = walk_bids_for_sell(&book, 62.0);
+        let w = walk_bids_for_sell(&book, 62.0, 0.0);
         assert_eq!(w.shares_filled, 0.0);
         assert!(w.capped_by_depth);
+    }
+
+    #[test]
+    fn price_floor_drops_thin_tail_from_walk() {
+        // Book: 5 good shares, then a long tail of cheap shares that
+        // would drag the VWAP below the floor if we didn't filter.
+        let book = ClobBook {
+            bids: vec![
+                ClobLevel { price: "0.30".into(), size: "5".into() },
+                ClobLevel { price: "0.05".into(), size: "100".into() },
+                ClobLevel { price: "0.02".into(), size: "500".into() },
+            ],
+            asks: vec![],
+        };
+
+        // With floor=0.091, only the $0.30 level qualifies; walk fills 5.
+        let w = walk_bids_for_sell(&book, 62.0, 0.091);
+        assert_eq!(w.shares_filled, 5.0);
+        assert!((w.avg_price - 0.30).abs() < 0.0001);
+        assert_eq!(w.levels_consumed, 1);
+        assert!(w.capped_by_depth);
+
+        // Without a floor, we'd drain all 62 shares at a diluted VWAP.
+        let w_legacy = walk_bids_for_sell(&book, 62.0, 0.0);
+        assert_eq!(w_legacy.shares_filled, 62.0);
+        assert!(w_legacy.avg_price < 0.091); // dilution confirmed
+    }
+
+    #[test]
+    fn price_floor_empty_book_returns_zero() {
+        let book = ClobBook {
+            bids: vec![ClobLevel { price: "0.05".into(), size: "50".into() }],
+            asks: vec![],
+        };
+        // Every level below the $0.091 floor → nothing filled.
+        let w = walk_bids_for_sell(&book, 62.0, 0.091);
+        assert_eq!(w.shares_filled, 0.0);
     }
 
     #[test]

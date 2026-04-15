@@ -177,15 +177,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // -- Final account snapshot --
+    // -- Final account snapshot + mark-to-market of held tails --
+    let open_value = paper.mark_to_market().await;
     let acct = paper.snapshot().await;
+
     tracing::info!("===============================================");
     tracing::info!("  FINAL ACCOUNT STATE");
     tracing::info!("===============================================");
     tracing::info!("  starting_bankroll:      ${:.2}", acct.starting_bankroll);
     tracing::info!("  bankroll_now:           ${:.2}", acct.bankroll_usdc);
-    tracing::info!("  net_pnl:                ${:+.2}", acct.net_pnl());
-    tracing::info!("  ROI:                    {:+.3}%", acct.roi_pct());
+    tracing::info!("  realized_pnl:           ${:+.2}", acct.realized_pnl());
+    tracing::info!("  realized_roi:           {:+.3}%", acct.roi_pct());
+    tracing::info!("  ---");
+    tracing::info!("  MARK TO MARKET");
+    tracing::info!("  tail_legs_mark_value:   ${:.2}", open_value);
+    tracing::info!(
+        "  net_pnl_at_mark:        ${:+.2}",
+        acct.net_pnl_at_mark(open_value)
+    );
+    tracing::info!("  roi_at_mark:            {:+.3}%", acct.roi_pct_at_mark(open_value));
     tracing::info!("  ---");
     tracing::info!("  cum_mint_count:         {}", acct.cum_mint_count);
     tracing::info!("  cum_mint_usdc_out:      ${:.2}", acct.cum_mint_usdc);
