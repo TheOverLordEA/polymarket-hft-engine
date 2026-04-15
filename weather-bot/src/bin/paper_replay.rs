@@ -28,7 +28,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use weather_bot::config::Config;
 use weather_bot::ctf_math::{neg_risk_bucket_condition_id, neg_risk_bucket_token_ids};
-use weather_bot::paper::PaperEngine;
+use weather_bot::paper::{DumpStrategy, PaperEngine};
 use weather_bot::types::{now_ns, BucketInfo, EventKind, WeatherEvent};
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +77,14 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
 
+    let dump_strategy = match config.paper_dump_strategy.as_str() {
+        "maker" => DumpStrategy::Maker {
+            markup: config.paper_maker_markup,
+            fill_rate: config.paper_maker_fill_rate,
+        },
+        _ => DumpStrategy::Taker,
+    };
+
     tracing::info!("===============================================");
     tracing::info!("  paper-replay — offline live-state replay     ");
     tracing::info!("===============================================");
@@ -88,8 +96,16 @@ async fn main() -> anyhow::Result<()> {
         config.min_dump_price,
         replay_limit,
     );
+    match dump_strategy {
+        DumpStrategy::Taker => tracing::info!("[CONFIG] dump_strategy=TAKER (walk bid book)"),
+        DumpStrategy::Maker { markup, fill_rate } => tracing::info!(
+            "[CONFIG] dump_strategy=MAKER (ask = max(mid, mint_cost) × {:.2}, fill_rate = {:.2})",
+            markup,
+            fill_rate
+        ),
+    }
 
-    let paper = PaperEngine::new(
+    let paper = PaperEngine::new_with_strategy(
         config.clob_api_url.clone(),
         config.paper_starting_bankroll,
         config.paper_max_concurrent_events,
@@ -97,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         config.min_dump_price,
         config.dump_fraction,
         PathBuf::from(&config.paper_log_path),
+        dump_strategy,
     );
 
     // -- Fetch live weather events from gamma --

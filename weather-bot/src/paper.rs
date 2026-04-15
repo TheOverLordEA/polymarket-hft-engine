@@ -231,6 +231,120 @@ pub async fn fetch_book(http: &Client, clob_url: &str, token_id: &str) -> Result
     Ok(book)
 }
 
+// -------- Dump strategy: taker walk vs maker-ask simulation --------
+//
+// # Background
+//
+// The taker walk (`walk_bids_for_sell`) models an impatient dumper: post a
+// market-sell, consume the bid side top-down. Gets certain execution at
+// prevailing bid prices. For weather markets today that's ~$0.33-0.42 on
+// hot legs (depending on book shape), which is strictly below what a
+// patient maker realizes.
+//
+// The reference competitor @IWantYourMoney doesn't dump as a taker. He
+// posts ASKS above the top bid and lets flow come to him — realized
+// ~$0.42/share avg on Lucknow 40°C vs current top bid of $0.25. The edge
+// is the maker-to-taker spread: roughly $40/cycle at the current book
+// shapes, or ~50% of the total measurement gap between paper and his
+// realized numbers.
+//
+// This module adds a simulated-maker alternative. It does NOT actually
+// post orders (that's a live-mode concern). It simulates what a maker
+// dump WOULD realize given:
+//
+//   1. An ask price: `max(clob_mid, mint_cost_per_share) * markup`.
+//      The `max` handles brand-new markets where the mid is the uniform
+//      prior `1/n_buckets`. Markup defaults to 1.10 (10% above fair).
+//
+//   2. A fill rate: constant probability that a maker-posted order gets
+//      lifted before the event resolves. Defaults to 0.75 — empirically
+//      calibrated against a casual read of the competitor's activity but
+//      NOT rigorously validated. This is the biggest free parameter in
+//      the model.
+//
+//   3. Partial-fill semantics: the filled fraction credits proceeds, the
+//      unfilled residual stays as a tail lottery ticket (handled by the
+//      existing residual_legs + resolver path — no special flatten).
+//
+// # Design decisions
+//
+// - **No ensemble fair-value model**: v1 uses the CLOB mid directly. An
+//   ensemble prior is a v2 task if the mid turns out to be a bad estimate
+//   (it isn't — the n=1 calibration against resolved outcomes agrees
+//   within 0.6pp).
+//
+// - **No timeout-flatten**: the 3b skip rule's whole reason for existing
+//   is that holding a tail leg dominates a below-cost dump. A T-2h
+//   "flatten residual to taker" would contradict that and surrender the
+//   ~$10/cycle tail resolution EV that 3c just measured. Unfilled maker
+//   asks stay as tails, period.
+//
+// - **No re-asks**: post once per cycle at the chosen markup. If the
+//   book moves, we don't chase. Keeps the v1 model tight and the fill
+//   rate a single knob.
+//
+// - **Same price floor as taker**: if `ask_price < max(min_dump_price,
+//   mint_cost_per_share)` the bucket gets skipped via the same logic as
+//   the taker path — maker doesn't let you dump at below cost either.
+//
+// # What v2 should add, in order
+//
+// 1. Empirical fill-rate from recent trade count on the token (replace
+//    the constant 0.75 with `recent_trades_60m >= 5 ? 0.75 : 0.40`).
+// 2. Ensemble fair-value model for the ask floor (replaces `max(mid,
+//    mint_cost)` with `max(mid, ensemble_fair, mint_cost)`).
+// 3. Per-bucket markup scaling (hot buckets at 1.10, tail buckets at
+//    1.05 or skip entirely).
+// 4. Timeout flatten ONLY if measurements show tail EV is below
+//    mid-1-tick at T-2h — an open empirical question.
+
+#[derive(Debug, Clone, Copy)]
+pub enum DumpStrategy {
+    /// Walk the bid side top-down with a per-level price floor. Models
+    /// an impatient dumper that gets certain execution at prevailing
+    /// bids. This is the pessimistic floor.
+    Taker,
+    /// Simulate posting a maker ask at `max(mid, mint_cost) * markup`
+    /// with a constant `fill_rate`. Partial fills credit the filled
+    /// fraction; unfilled residual stays as tail leg.
+    Maker { markup: f64, fill_rate: f64 },
+}
+
+impl Default for DumpStrategy {
+    fn default() -> Self {
+        DumpStrategy::Taker
+    }
+}
+
+/// Simulate a maker dump: post one ask at `ask_price`, assume
+/// `fill_rate` of the target fills before expiry. Returns a WalkedFill
+/// compatible with the taker path so the rest of `run_event` doesn't
+/// need to branch.
+pub fn simulate_maker_dump(
+    book: &ClobBook,
+    target_shares: f64,
+    markup: f64,
+    fill_rate: f64,
+    mint_cost_per_share: f64,
+) -> WalkedFill {
+    // Fair value = max(clob mid, mint_cost_per_share). The latter is the
+    // uniform prior (1/n_buckets) and acts as a floor for brand-new books.
+    let mid = book_midpoint(book).unwrap_or(mint_cost_per_share);
+    let fair = mid.max(mint_cost_per_share);
+    let ask_price = fair * markup;
+
+    let filled = target_shares * fill_rate;
+    let gross = filled * ask_price;
+
+    WalkedFill {
+        shares_filled: filled,
+        gross_proceeds_usdc: gross,
+        avg_price: ask_price,
+        levels_consumed: 1,
+        capped_by_depth: false,
+    }
+}
+
 /// Walk the BID side of the book (we're selling), taking as many levels as
 /// needed to fill `target_shares` or exhaust the book. Any level priced
 /// below `min_price` is dropped BEFORE walking — this prevents a thin-tail
@@ -331,6 +445,7 @@ pub struct PaperEngine {
     min_dump_price: f64,
     dump_fraction: f64,
     taker_fee_bps: u16,
+    dump_strategy: DumpStrategy,
 }
 
 impl PaperEngine {
@@ -342,6 +457,28 @@ impl PaperEngine {
         min_dump_price: f64,
         dump_fraction: f64,
         log_path: PathBuf,
+    ) -> Self {
+        Self::new_with_strategy(
+            clob_url,
+            starting_bankroll,
+            max_concurrent_events,
+            mint_amount_usdc,
+            min_dump_price,
+            dump_fraction,
+            log_path,
+            DumpStrategy::default(),
+        )
+    }
+
+    pub fn new_with_strategy(
+        clob_url: String,
+        starting_bankroll: f64,
+        max_concurrent_events: usize,
+        mint_amount_usdc: f64,
+        min_dump_price: f64,
+        dump_fraction: f64,
+        log_path: PathBuf,
+        dump_strategy: DumpStrategy,
     ) -> Self {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -357,6 +494,7 @@ impl PaperEngine {
             min_dump_price,
             dump_fraction,
             taker_fee_bps: DEFAULT_TAKER_FEE_BPS,
+            dump_strategy,
         }
     }
 
@@ -481,7 +619,41 @@ impl PaperEngine {
             // dump at price < cost-basis is strictly dominated by holding
             // the share as a tail lottery ticket.
             let price_floor = self.min_dump_price.max(mint_cost_per_share);
-            let walked = walk_bids_for_sell(&book, target_dump, price_floor);
+
+            // Branch on dump strategy. Taker walks the bid book with the
+            // price floor; Maker simulates one ask post at a markup above
+            // fair value and credits `fill_rate * target_dump` shares at
+            // that ask price. Both paths produce a WalkedFill so the rest
+            // of this loop is strategy-agnostic.
+            let walked = match self.dump_strategy {
+                DumpStrategy::Taker => {
+                    walk_bids_for_sell(&book, target_dump, price_floor)
+                }
+                DumpStrategy::Maker { markup, fill_rate } => {
+                    let w = simulate_maker_dump(
+                        &book,
+                        target_dump,
+                        markup,
+                        fill_rate,
+                        mint_cost_per_share,
+                    );
+                    // Apply the price floor post-hoc for consistency with
+                    // the taker path. Normally `fair * markup` is well
+                    // above the floor (fair >= mint_cost, markup >= 1.0),
+                    // but brand-new markets with sub-floor mids could slip.
+                    if w.avg_price < price_floor {
+                        WalkedFill {
+                            shares_filled: 0.0,
+                            gross_proceeds_usdc: 0.0,
+                            avg_price: w.avg_price,
+                            levels_consumed: 0,
+                            capped_by_depth: false,
+                        }
+                    } else {
+                        w
+                    }
+                }
+            };
 
             if walked.shares_filled < 1.0 {
                 // Nothing filled above the floor — either the book was
@@ -957,6 +1129,56 @@ mod tests {
         // Every level below the $0.091 floor → nothing filled.
         let w = walk_bids_for_sell(&book, 62.0, 0.091);
         assert_eq!(w.shares_filled, 0.0);
+    }
+
+    #[test]
+    fn maker_sim_uses_mid_times_markup() {
+        // Mid = ($0.38 + $0.42) / 2 = $0.40. Markup 1.10 → ask $0.44.
+        let book = ClobBook {
+            bids: vec![ClobLevel { price: "0.38".into(), size: "100".into() }],
+            asks: vec![ClobLevel { price: "0.42".into(), size: "100".into() }],
+        };
+        let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
+        // Ask = ($0.40) × 1.10 = $0.44
+        assert!((w.avg_price - 0.44).abs() < 0.0001);
+        // Filled = 100 × 0.75 = 75
+        assert!((w.shares_filled - 75.0).abs() < 0.0001);
+        // Gross = 75 × 0.44 = 33
+        assert!((w.gross_proceeds_usdc - 33.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn maker_sim_uses_mint_cost_floor_when_no_mid() {
+        // Empty book → fair falls back to mint_cost_per_share ($0.091).
+        // Ask = $0.091 × 1.10 = $0.1001
+        let book = ClobBook { bids: vec![], asks: vec![] };
+        let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
+        assert!((w.avg_price - 0.1001).abs() < 0.0001);
+        assert!((w.shares_filled - 75.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn maker_sim_uses_mid_when_mid_above_mint_cost() {
+        // Mid = $0.30 > mint_cost_per_share $0.091 → use mid.
+        let book = ClobBook {
+            bids: vec![ClobLevel { price: "0.28".into(), size: "50".into() }],
+            asks: vec![ClobLevel { price: "0.32".into(), size: "50".into() }],
+        };
+        let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
+        // Mid = 0.30, ask = 0.33
+        assert!((w.avg_price - 0.33).abs() < 0.0001);
+    }
+
+    #[test]
+    fn maker_sim_uses_floor_when_mid_below_mint_cost() {
+        // Mid = $0.05 < mint_cost_per_share $0.091 → use floor.
+        let book = ClobBook {
+            bids: vec![ClobLevel { price: "0.04".into(), size: "50".into() }],
+            asks: vec![ClobLevel { price: "0.06".into(), size: "50".into() }],
+        };
+        let w = simulate_maker_dump(&book, 100.0, 1.10, 0.75, 0.091);
+        // fair = max(0.05, 0.091) = 0.091, ask = 0.091 × 1.10 = 0.1001
+        assert!((w.avg_price - 0.1001).abs() < 0.0001);
     }
 
     #[test]

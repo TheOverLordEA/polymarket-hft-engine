@@ -59,6 +59,16 @@ pub struct Config {
     pub paper_max_concurrent_events: usize,
     /// Where to append the structured CSV log.
     pub paper_log_path: String,
+    /// "taker" (walk bid book) or "maker" (simulate ask at markup).
+    /// Default "taker" — the pessimistic floor.
+    pub paper_dump_strategy: String,
+    /// When `paper_dump_strategy == "maker"`, the ask is priced at
+    /// `max(clob_mid, mint_cost) * maker_markup`. 1.10 = 10% above fair.
+    pub paper_maker_markup: f64,
+    /// When `paper_dump_strategy == "maker"`, fraction of the target
+    /// shares we assume the maker ask fills before expiry. 0.75 is a
+    /// loose calibration; v2 should replace with an empirical model.
+    pub paper_maker_fill_rate: f64,
 }
 
 impl Default for Config {
@@ -103,6 +113,9 @@ impl Default for Config {
             paper_starting_bankroll: 1000.0,
             paper_max_concurrent_events: 8,
             paper_log_path: "paper_run.log".to_string(),
+            paper_dump_strategy: "taker".to_string(),
+            paper_maker_markup: 1.10,
+            paper_maker_fill_rate: 0.75,
         }
     }
 }
@@ -192,6 +205,22 @@ impl Config {
         }
         if let Ok(v) = std::env::var("PAPER_LOG_PATH") {
             cfg.paper_log_path = v;
+        }
+        if let Ok(v) = std::env::var("PAPER_DUMP_STRATEGY") {
+            let lower = v.to_lowercase();
+            if lower == "taker" || lower == "maker" {
+                cfg.paper_dump_strategy = lower;
+            }
+        }
+        if let Ok(v) = std::env::var("PAPER_MAKER_MARKUP") {
+            if let Ok(f) = v.parse() {
+                cfg.paper_maker_markup = f;
+            }
+        }
+        if let Ok(v) = std::env::var("PAPER_MAKER_FILL_RATE") {
+            if let Ok(f) = v.parse() {
+                cfg.paper_maker_fill_rate = f;
+            }
         }
 
         // Invariant: paper_mode forces simulation
