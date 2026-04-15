@@ -616,6 +616,163 @@ impl PaperEngine {
         self.account.lock().await.clone()
     }
 
+    /// Sweep open positions for resolved events and settle them. For each
+    /// unique event_slug in `open_positions`, query gamma for its
+    /// `closed` state and `outcomePrices`. If closed:
+    ///   - Move every bucket position for that event to `closed_positions`
+    ///   - Credit `bankroll_usdc` with `shares * price` where price is the
+    ///     on-chain outcome price ($1 for the winning bucket, $0 for the
+    ///     losing ones — or the intermediate value if the oracle reported
+    ///     a partial payout, which happens occasionally for ambiguous
+    ///     temperature readings).
+    ///
+    /// For the long-running bot, call this on a `tokio::time::interval`
+    /// (e.g. every 60s). For the replay harness, call it once at the end
+    /// of the run — any event that's already resolved gets settled, the
+    /// rest stay in `open_positions` and fall back to the CLOB-mid mark.
+    ///
+    /// Returns the USDC value credited to the bankroll from resolutions.
+    pub async fn resolve_settled_events(&self, gamma_url: &str) -> Result<f64> {
+        // Collect unique slugs from the open positions first to avoid
+        // holding the account lock across network I/O.
+        let slugs: std::collections::HashSet<String> = {
+            let acct = self.account.lock().await;
+            acct.open_positions.iter().map(|p| p.event_slug.clone()).collect()
+        };
+        tracing::info!(
+            "[PAPER] resolve_settled_events: checking {} unique slugs",
+            slugs.len()
+        );
+
+        let mut total_credit = 0.0;
+        let mut resolved_events = 0usize;
+        let mut resolved_positions = 0usize;
+
+        for slug in slugs {
+            let url = format!("{}/events/slug/{}", gamma_url, slug);
+            let ev: serde_json::Value = match self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+            {
+                Ok(r) => match r.json().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+
+            // Gamma's `closed` flag updates lazily (events 13h past
+            // resolution still report closed:false). The reliable signal
+            // is: endDate in the past AND at least one market has an
+            // outcomePrices that's not the uniform prior.
+            let closed = ev.get("closed").and_then(|c| c.as_bool()).unwrap_or(false);
+            let end_unix = ev
+                .get("endDate")
+                .and_then(|d| d.as_str())
+                .map(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|dt| dt.timestamp())
+                        .unwrap_or(i64::MAX)
+                })
+                .unwrap_or(i64::MAX);
+            let now_unix = chrono::Utc::now().timestamp();
+            let past_end = end_unix <= now_unix;
+            if !closed && !past_end {
+                continue;
+            }
+
+            // Build a bucket_label -> winning bool map. Gamma exposes
+            // outcomePrices per market as a JSON-encoded string. Index 0 is
+            // YES, index 1 is NO. yes_price > 0.5 means this bucket wins.
+            //
+            // If NO market has a resolved outcomePrices yet (all still at
+            // uniform priors), skip — the oracle hasn't reported.
+            let mut winning_labels: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut resolved_any = false;
+            if let Some(markets) = ev.get("markets").and_then(|m| m.as_array()) {
+                for m in markets {
+                    let q = m.get("question").and_then(|q| q.as_str()).unwrap_or("");
+                    let label = crate::scanner::extract_temp_label(q);
+                    let prices_str = m
+                        .get("outcomePrices")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("[]");
+                    let prices: Vec<String> =
+                        serde_json::from_str(prices_str).unwrap_or_default();
+                    let yes_price = prices
+                        .first()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(-1.0);
+                    if yes_price < 0.0 {
+                        continue;
+                    }
+                    // Uniform prior = unresolved. A resolved market reports
+                    // either "0" or "1" exactly.
+                    if yes_price == 0.0 || yes_price == 1.0 {
+                        resolved_any = true;
+                    }
+                    if yes_price > 0.5 {
+                        winning_labels.insert(label);
+                    }
+                }
+            }
+            if !resolved_any {
+                continue;
+            }
+
+            // Now take the account lock and settle every position for this
+            // slug.
+            let mut acct = self.account.lock().await;
+            let (to_close, stay): (Vec<_>, Vec<_>) = acct
+                .open_positions
+                .drain(..)
+                .partition(|p| p.event_slug == slug);
+            acct.open_positions = stay;
+
+            let event_credit: f64 = to_close
+                .iter()
+                .map(|p| {
+                    if winning_labels.contains(&p.bucket_label) {
+                        p.shares_held * 1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+
+            resolved_positions += to_close.len();
+            total_credit += event_credit;
+            resolved_events += 1;
+            acct.bankroll_usdc += event_credit;
+            acct.cum_realized_pnl += event_credit;
+            acct.closed_positions.extend(to_close);
+            acct.open_event_slugs.retain(|s| s != &slug);
+            drop(acct);
+
+            self.log.append(
+                &slug,
+                "resolution_settled",
+                serde_json::json!({
+                    "winners": winning_labels.iter().collect::<Vec<_>>(),
+                    "credit_usdc": event_credit,
+                }),
+                -1.0,
+            );
+        }
+
+        tracing::info!(
+            "[PAPER] resolved {} events, {} positions settled, +${:.2} credited",
+            resolved_events,
+            resolved_positions,
+            total_credit
+        );
+        Ok(total_credit)
+    }
+
     /// Mark-to-market all open (tail) positions at the current CLOB
     /// midpoint. Fetches `/book` for each held token_id, uses
     /// `(best_bid + best_ask) / 2` as the share's implied win probability,

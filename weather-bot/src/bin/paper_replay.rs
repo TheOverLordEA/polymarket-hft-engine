@@ -177,7 +177,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // -- Final account snapshot + mark-to-market of held tails --
+    // -- Settle anything that has already resolved, then mark-to-market
+    //    the rest at CLOB midpoint. Resolution is authoritative ($1/$0
+    //    from the oracle); mid is an estimate for events still trading.
+    let settled_credit = paper
+        .resolve_settled_events(&config.gamma_api_url)
+        .await
+        .unwrap_or(0.0);
     let open_value = paper.mark_to_market().await;
     let acct = paper.snapshot().await;
 
@@ -189,8 +195,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  realized_pnl:           ${:+.2}", acct.realized_pnl());
     tracing::info!("  realized_roi:           {:+.3}%", acct.roi_pct());
     tracing::info!("  ---");
-    tracing::info!("  MARK TO MARKET");
-    tracing::info!("  tail_legs_mark_value:   ${:.2}", open_value);
+    tracing::info!("  RESOLUTION + MARK TO MARKET");
+    tracing::info!("  settled_credit:         ${:+.2}", settled_credit);
+    tracing::info!("  unresolved_mark_value:  ${:.2}", open_value);
     tracing::info!(
         "  net_pnl_at_mark:        ${:+.2}",
         acct.net_pnl_at_mark(open_value)
