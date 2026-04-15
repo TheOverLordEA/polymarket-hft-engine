@@ -1,26 +1,12 @@
-mod alerts;
-mod config;
-mod ctf_math;
-mod executor;
-mod mint_executor;
-mod paper;
-mod presigner;
-mod scanner;
-mod state;
-mod types;
-mod watchers;
-mod weather_filter;
-
-use crate::alerts::send_alert;
-use crate::config::Config;
-use crate::executor::Executor;
-use crate::mint_executor::MintExecutor;
-use crate::paper::PaperEngine;
-use crate::presigner::{OrderTemplate, Presigner};
-use crate::state::BotState;
-use crate::types::{
-    ClobMarketReady, MintReceipt, WeatherEvent,
-};
+use weather_bot::alerts::send_alert;
+use weather_bot::config::Config;
+use weather_bot::executor::Executor;
+use weather_bot::mint_executor::MintExecutor;
+use weather_bot::paper::PaperEngine;
+use weather_bot::presigner::{OrderTemplate, Presigner};
+use weather_bot::state::BotState;
+use weather_bot::types::{ClobMarketReady, MintReceipt, WeatherEvent};
+use weather_bot::watchers;
 use alloy_primitives::Address;
 use std::path::PathBuf;
 use std::sync::Arc;

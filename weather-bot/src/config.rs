@@ -71,12 +71,24 @@ impl Default for Config {
             clob_ws_user_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string(),
             clob_anchor_asset_id: String::new(),
 
-            polygon_wss_url: "wss://polygon-rpc.com".to_string(),
+            // wss://polygon-rpc.com does NOT serve WebSocket (returns HTML
+            // on upgrade). wss://1rpc.io/matic responds with HTTP 101 and
+            // honors eth_subscribe — fine for paper/dev. Live HFT should
+            // use Alchemy or QuickNode.
+            polygon_wss_url: "wss://1rpc.io/matic".to_string(),
             polygon_rpc_urls: vec!["https://polygon-rpc.com".to_string()],
             private_key: String::new(),
             funder_address: None,
 
-            mint_amount_usdc: 10.0,
+            // $62 matches the competitor's production sizing: above the
+            // rewardsMinSize=50 floor (24% buffer), and with 8 concurrent
+            // events against a $1000 bankroll it's $62 * 2 ops * 8 = $992
+            // working capital, a tight but viable fit. Was $10 as a
+            // placeholder from an earlier scoping conversation; that value
+            // is BELOW the rewards floor and produces self-consistent but
+            // off-strategy paper numbers. Do not lower unless you
+            // explicitly want pre-rewards edge measurements.
+            mint_amount_usdc: 62.0,
             min_dump_price: 0.08,
             dump_fraction: 0.95,
             daily_cap_usdc: 200.0,

@@ -7,6 +7,10 @@ edition = "2021"
 name = "weather-bot"
 path = "src/main.rs"
 
+[[bin]]
+name = "paper-replay"
+path = "src/bin/paper_replay.rs"
+
 [dependencies]
 core-shared = { path = "../core-shared" }
 tokio = { version = "1", features = ["full"] }

@@ -1,32 +1,74 @@
 //! Paper-trading engine.
 //!
 //! Drop-in replacement for `mint_executor` + `presigner` when
-//! `config.paper_mode == true`. Runs the **same decision path** as live
-//! (event-driven, same slug filter, same mint sizing, same dump logic) but:
+//! `config.paper_mode == true`. Runs the same decision path as live
+//! (event-driven, same slug filter, same mint sizing) but shadows the
+//! on-chain + CLOB sides:
 //!
 //!   - does NOT broadcast any Polygon transactions
 //!   - does NOT POST any CLOB orders
 //!   - fetches REAL orderbook depth for each bucket it would dump into
-//!   - walks the book with slippage + taker fees to compute realistic fill
+//!   - walks the book with taker fees to compute a realistic fill
 //!   - tracks a virtual USDC bankroll with a concurrent-events cap
-//!   - appends every event (mint, dump, resolution) to a CSV log
+//!   - appends every event (mint, dump, cycle) to a structured log
 //!
-//! This means: when we flip the bot to live, the ROI we measured in paper
-//! should match within slippage variance. No surprises.
+//! # KNOWN LIMITATIONS — read before interpreting the numbers
 //!
-//! # Fee assumptions (verify empirically before going live)
+//! Paper ROI is a **lower bound**, not a faithful replica of live P&L.
+//! Three systematic biases push the measured number below reality:
 //!
-//!   CLOB taker fee   = 0 bps   (confirmed: Polymarket sets feeRateBps=0 on fills)
+//! **1. Taker-dump assumption.** `run_event` walks the BID side of the
+//!    book and consumes levels as a taker. The reference wallet
+//!    (`@IWantYourMoney`) does NOT do this — he posts ASKS above the top
+//!    bid and waits for flow, realizing ~$0.42/share avg on Lucknow 40°C
+//!    where the top bid today is $0.25. A taker walk underestimates his
+//!    realized price by $0.15–0.20/share × ~200 hot-leg shares/cycle =
+//!    $30–40 per cycle of missing edge. Paper measures the PESSIMISTIC
+//!    bound of an impatient-dumper strategy, NOT the maker-flush strategy
+//!    you would run live. TODO: add `MakerDumpStrategy { markup, fill_rate_model }`
+//!    and keep taker as the floor.
+//!
+//! **2. Rebate income not modeled.** CLOB liquidity rewards pay ~23 USDC/day
+//!    per qualifying market to makers. `MINT_AMOUNT_USDC = $62` is chosen
+//!    specifically to clear the `rewardsMinSize = 50` eligibility floor, so
+//!    the live strategy DOES earn this rebate stream. Paper treats it as
+//!    zero. At ~80 weather markets/day and fractional share of eligible
+//!    liquidity, missing income is on the order of $5–$50/day.
+//!
+//! **3. Tail-leg resolution EV not modeled.** Residual shares from
+//!    incomplete dumps are stored at `effective_cost_per_share = 0` (free
+//!    lottery tickets) but are NEVER marked to $1 on win or $0 on loss at
+//!    resolution. For a $62 mint across 11 buckets, tail-leg EV is
+//!    ~$5–7/cycle, or roughly 30–50% of total edge. Paper swallows all of
+//!    it. A gamma-events poller that marks `open_positions` at resolution
+//!    is a must-have before comparing paper to anything meaningful. TODO,
+//!    not in this commit.
+//!
+//! **Net effect**: paper's `cycle_pnl` is a go/no-go FLOOR. If paper is
+//! profitable at a given mint size, live should be MORE profitable. If
+//! paper is unprofitable, live *might* still be profitable, but you've
+//! ruled out the pessimistic case. Do NOT compare paper ROI directly to
+//! `@IWantYourMoney`'s realized numbers — you're measuring a different
+//! execution style.
+//!
+//! # Pre-live gotcha: presigner stub
+//!
+//! `presigner::estimate_bucket_price` returns `$0.10` for every bucket.
+//! Paper bypasses it entirely, but live mode uses it for maker-side
+//! quoting. Replace it with a real estimator (fetch `/book` at presign
+//! time, or use a climatology prior) BEFORE any live order is posted,
+//! or every first live cycle will post asks at stub-price nonsense.
+//!
+//! # Fee assumptions (verified against CLOB endpoints)
+//!
+//!   CLOB taker fee   = 0 bps   (Polymarket sets feeRateBps=0 on fills)
 //!   CLOB maker fee   = 0 bps
 //!   Gas (split)      = $0.008  (200k gas × 50 gwei × $0.65 MATIC)
 //!   Gas (convert)    = $0.012  (300k × 50 × $0.65)
 //!   Gas (redeem)     = $0.006  (150k × 50 × $0.65)
-//!   NegRisk feeBips  = 0 bps   (paper default; real value is per-market — read
-//!                              from NegRiskAdapter.MarketPrepared when the
-//!                              onchain watcher decodes logs)
-//!
-//! Rebate income (CLOB rewards ≈ 23 USDC/day per qualifying market) is NOT
-//! modeled. Consider it upside — the measured ROI is a floor.
+//!   NegRisk feeBips  = 0 bps   (per-market default; real value emitted in
+//!                              NegRiskAdapter.MarketPrepared — onchain
+//!                              watcher TODO to decode and override)
 
 use crate::types::{BucketInfo, WeatherEvent};
 use anyhow::{Context, Result};
