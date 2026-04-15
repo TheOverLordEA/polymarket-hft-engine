@@ -8,3 +8,8 @@ target/
 
 # Logs
 *.log
+
+# Bot runtime state
+bot_state.json
+weather-bot/bot_state.json
+weather-bot/config.json
