@@ -1,8 +1,7 @@
 [workspace]
 members = [
     "core-shared",
-    "btc-5min-bot",
-    "eth-5min-bot"
+    "weather-bot"
 ]
 resolver = "2"
 
