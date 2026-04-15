@@ -3,6 +3,7 @@ mod config;
 mod ctf_math;
 mod executor;
 mod mint_executor;
+mod paper;
 mod presigner;
 mod scanner;
 mod state;
@@ -14,12 +15,14 @@ use crate::alerts::send_alert;
 use crate::config::Config;
 use crate::executor::Executor;
 use crate::mint_executor::MintExecutor;
+use crate::paper::PaperEngine;
 use crate::presigner::{OrderTemplate, Presigner};
 use crate::state::BotState;
 use crate::types::{
     ClobMarketReady, MintReceipt, WeatherEvent,
 };
 use alloy_primitives::Address;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::{mpsc, Mutex};
@@ -42,9 +45,16 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    let mode_label = if config.paper_mode {
+        "PAPER"
+    } else if config.simulation {
+        "SIMULATION"
+    } else {
+        "LIVE"
+    };
     tracing::info!(
         "[CONFIG] mode={} mint=${:.2} daily_cap=${:.0} min_dump=${:.3} dump_frac={:.2}",
-        if config.simulation { "SIMULATION" } else { "LIVE" },
+        mode_label,
         config.mint_amount_usdc,
         config.daily_cap_usdc,
         config.min_dump_price,
@@ -52,6 +62,14 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!("[CONFIG] polygon_wss={}", config.polygon_wss_url);
     tracing::info!("[CONFIG] clob_ws={}", config.clob_ws_market_url);
+    if config.paper_mode {
+        tracing::info!(
+            "[CONFIG] paper: bankroll=${:.0} max_concurrent={} log={}",
+            config.paper_starting_bankroll,
+            config.paper_max_concurrent_events,
+            config.paper_log_path,
+        );
+    }
 
     // --- Executors ---
     let executor = Arc::new(
@@ -71,6 +89,22 @@ async fn main() -> anyhow::Result<()> {
             mint_amount_usdc: config.mint_amount_usdc,
         },
     ));
+    // Paper engine is only instantiated when paper_mode is on. When enabled
+    // it shadows mint_exec + presigner entirely — we take the PaperEngine
+    // branch in the main select arm below and skip the live executors.
+    let paper_engine: Option<Arc<PaperEngine>> = if config.paper_mode {
+        Some(Arc::new(PaperEngine::new(
+            config.clob_api_url.clone(),
+            config.paper_starting_bankroll,
+            config.paper_max_concurrent_events,
+            config.mint_amount_usdc,
+            config.min_dump_price,
+            config.dump_fraction,
+            PathBuf::from(&config.paper_log_path),
+        )))
+    } else {
+        None
+    };
 
     send_alert(&config, "🌡️ Weather HFT bot started").await;
 
@@ -123,6 +157,23 @@ async fn main() -> anyhow::Result<()> {
                     event.detected_at_ns,
                 );
 
+                // ==== PAPER MODE SHORT-CIRCUIT ====
+                // When paper_mode is on, the PaperEngine owns the whole
+                // event lifecycle (bankroll check, virtual mint, real
+                // orderbook walk, fee-adjusted P&L, CSV logging) in ONE
+                // async call. No mint_exec / presigner involvement.
+                if let Some(paper) = paper_engine.clone() {
+                    let event_for_paper = event.clone();
+                    tokio::spawn(async move {
+                        let now_unix = chrono::Utc::now().timestamp();
+                        if let Err(e) = paper.run_event(&event_for_paper, now_unix).await {
+                            tracing::error!("[PAPER] {}: {}", event_for_paper.event_slug, e);
+                        }
+                    });
+                    continue;
+                }
+
+                // ==== LIVE / SIMULATION (non-paper) PATH ====
                 // 1) Daily cap check
                 {
                     let mut s = state.lock().await;

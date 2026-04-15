@@ -47,6 +47,18 @@ pub struct Config {
     pub simulation: bool,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
+
+    // -------- Paper-trading mode --------
+    /// When true, the bot runs through the PaperEngine instead of the
+    /// live mint executor: real orderbooks, real fees, virtual bankroll.
+    /// Can only be true if `simulation == true` (paper implies sim).
+    pub paper_mode: bool,
+    /// Virtual USDC bankroll to start the paper run with.
+    pub paper_starting_bankroll: f64,
+    /// Max simultaneously-open events — paper run skips new mints once full.
+    pub paper_max_concurrent_events: usize,
+    /// Where to append the structured CSV log.
+    pub paper_log_path: String,
 }
 
 impl Default for Config {
@@ -74,6 +86,11 @@ impl Default for Config {
             simulation: true,
             telegram_bot_token: None,
             telegram_chat_id: None,
+
+            paper_mode: true,
+            paper_starting_bankroll: 1000.0,
+            paper_max_concurrent_events: 8,
+            paper_log_path: "paper_run.log".to_string(),
         }
     }
 }
@@ -145,6 +162,29 @@ impl Config {
         }
         if let Ok(sim) = std::env::var("SIMULATION") {
             cfg.simulation = sim == "true" || sim == "1";
+        }
+
+        // --- paper mode ---
+        if let Ok(v) = std::env::var("PAPER_MODE") {
+            cfg.paper_mode = v == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("PAPER_STARTING_BANKROLL") {
+            if let Ok(f) = v.parse() {
+                cfg.paper_starting_bankroll = f;
+            }
+        }
+        if let Ok(v) = std::env::var("PAPER_MAX_CONCURRENT_EVENTS") {
+            if let Ok(n) = v.parse() {
+                cfg.paper_max_concurrent_events = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PAPER_LOG_PATH") {
+            cfg.paper_log_path = v;
+        }
+
+        // Invariant: paper_mode forces simulation
+        if cfg.paper_mode {
+            cfg.simulation = true;
         }
 
         cfg
